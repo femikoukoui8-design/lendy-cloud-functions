@@ -1,0 +1,256 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // ===============================================================
+    // Assumed Data Model — see DATA_MODEL.md for full field docs
+    // ===============================================================
+    //
+    // Collection: users/{uid}
+    //   uid, email, displayName, photoURL?, phone?, createdAt, updatedAt
+    //   Contains PII (email, phone) -> owner-only read.
+    //   Admin privilege comes from a custom claim (auth.token.admin),
+    //   never from a field on this document.
+    //
+    // Collection: equipment/{equipmentId}
+    //   ownerId, ownerName, ownerPhotoURL?, title, description, category,
+    //   dailyRate, depositAmount, photos?, status, city?, createdAt, updatedAt
+    //   No PII -> readable by any authenticated user.
+    //
+    // Collection: bookings/{bookingId}
+    //   equipmentId, ownerId, renterId, startDate, endDate, status,
+    //   totalPrice, depositAmount, createdAt, updatedAt
+    //   Only the renter, the equipment owner, or an admin may read/write.
+    //
+    // ===============================================================
+
+    // ===============================================================
+    // Helper functions
+    // ===============================================================
+
+    function isAuthenticated() {
+      return request.auth != null;
+    }
+
+    function isAdmin() {
+      return isAuthenticated() && request.auth.token.admin == true;
+    }
+
+    function isOwner(userId) {
+      return isAuthenticated() && request.auth.uid == userId;
+    }
+
+    function hasRequiredFields(fields) {
+      return request.resource.data.keys().hasAll(fields);
+    }
+
+    function hasOnlyAllowedFields(fields) {
+      return request.resource.data.keys().hasOnly(fields);
+    }
+
+    function areImmutableFieldsUnchanged(fields) {
+      return !request.resource.data.diff(resource.data).affectedKeys().hasAny(fields);
+    }
+
+    function isValidUrl(url) {
+      return url is string &&
+        url.size() < 500 &&
+        (url.matches("^https://.*") || url.matches("^http://.*"));
+    }
+
+    function isValidEmail(email) {
+      return email is string &&
+        email.matches("^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\\.[a-zA-Z]{2,}$");
+    }
+
+    function isValidStringLength(field, minLen, maxLen) {
+      return request.resource.data[field] is string &&
+        request.resource.data[field].size() >= minLen &&
+        request.resource.data[field].size() <= maxLen;
+    }
+
+    function isValidOptionalStringLength(field, maxLen) {
+      return !(field in request.resource.data) ||
+        (request.resource.data[field] is string &&
+         request.resource.data[field].size() <= maxLen);
+    }
+
+    function isPositiveNumber(field, maxValue) {
+      return request.resource.data[field] is number &&
+        request.resource.data[field] > 0 &&
+        request.resource.data[field] <= maxValue;
+    }
+
+    function isNonNegativeNumber(field, maxValue) {
+      return request.resource.data[field] is number &&
+        request.resource.data[field] >= 0 &&
+        request.resource.data[field] <= maxValue;
+    }
+
+    function isRecentServerTimestamp(field) {
+      return request.resource.data[field] is timestamp &&
+        request.resource.data[field] > request.time - duration.value(5, 'm') &&
+        request.resource.data[field] <= request.time;
+    }
+
+    // ===============================================================
+    // Domain validators
+    // ===============================================================
+
+    function isValidUser(data) {
+      return hasOnlyAllowedFields(
+               ['uid', 'email', 'displayName', 'photoURL', 'phone', 'createdAt', 'updatedAt']
+             ) &&
+             hasRequiredFields(['uid', 'email', 'displayName', 'createdAt', 'updatedAt']) &&
+             data.uid is string && data.uid == request.auth.uid &&
+             isValidEmail(data.email) &&
+             data.email == request.auth.token.email &&
+             isValidStringLength('displayName', 1, 50) &&
+             isValidOptionalStringLength('phone', 20) &&
+             (!('photoURL' in data) || isValidUrl(data.photoURL)) &&
+             data.createdAt is timestamp &&
+             data.updatedAt is timestamp;
+    }
+
+    function isValidEquipmentPhotos() {
+      return !('photos' in request.resource.data) ||
+        (request.resource.data.photos is list &&
+         request.resource.data.photos.size() <= 10);
+      // Note: per-URL validation of list contents is intentionally light here;
+      // harden with an allOf/exists-based check if photos become user-critical.
+    }
+
+    function isValidEquipment(data) {
+      let allowedCategories = ['camera', 'lens', 'drone', 'audio', 'lighting', 'accessory', 'other'];
+      let allowedStatuses = ['available', 'unavailable', 'archived'];
+      return hasOnlyAllowedFields([
+               'ownerId', 'ownerName', 'ownerPhotoURL', 'title', 'description',
+               'category', 'dailyRate', 'depositAmount', 'photos', 'status',
+               'city', 'createdAt', 'updatedAt'
+             ]) &&
+             hasRequiredFields([
+               'ownerId', 'ownerName', 'title', 'description', 'category',
+               'dailyRate', 'depositAmount', 'status', 'createdAt', 'updatedAt'
+             ]) &&
+             data.ownerId is string && data.ownerId == request.auth.uid &&
+             isValidStringLength('ownerName', 1, 50) &&
+             (!('ownerPhotoURL' in data) || isValidUrl(data.ownerPhotoURL)) &&
+             isValidStringLength('title', 1, 100) &&
+             isValidStringLength('description', 1, 2000) &&
+             data.category in allowedCategories &&
+             isPositiveNumber('dailyRate', 100000) &&
+             isNonNegativeNumber('depositAmount', 1000000) &&
+             isValidEquipmentPhotos() &&
+             data.status in allowedStatuses &&
+             isValidOptionalStringLength('city', 100) &&
+             data.createdAt is timestamp &&
+             data.updatedAt is timestamp;
+    }
+
+    function isValidBookingCreate(data) {
+      let equipmentDoc = get(/databases/$(database)/documents/equipment/$(data.equipmentId));
+      return hasOnlyAllowedFields([
+               'equipmentId', 'ownerId', 'renterId', 'startDate', 'endDate',
+               'status', 'totalPrice', 'depositAmount', 'createdAt', 'updatedAt'
+             ]) &&
+             hasRequiredFields([
+               'equipmentId', 'ownerId', 'renterId', 'startDate', 'endDate',
+               'status', 'totalPrice', 'depositAmount', 'createdAt', 'updatedAt'
+             ]) &&
+             data.equipmentId is string &&
+             data.ownerId == equipmentDoc.data.ownerId &&
+             data.renterId == request.auth.uid &&
+             data.ownerId != data.renterId &&
+             data.startDate is timestamp &&
+             data.endDate is timestamp &&
+             data.endDate > data.startDate &&
+             data.status == 'requested' &&
+             isPositiveNumber('totalPrice', 10000000) &&
+             isNonNegativeNumber('depositAmount', 10000000) &&
+             data.createdAt is timestamp &&
+             data.updatedAt is timestamp;
+    }
+
+    // Only the status (and updatedAt) may change after creation, and only
+    // along an allowed transition performed by the correct party.
+    function isValidBookingStatusUpdate() {
+      let prev = resource.data.status;
+      let next = request.resource.data.status;
+      let onlyStatusAndUpdatedAtChanged =
+        request.resource.data.diff(resource.data).affectedKeys().hasOnly(['status', 'updatedAt']);
+
+      let renterCancel = isOwner(resource.data.renterId) &&
+        prev in ['requested', 'confirmed'] && next == 'cancelled';
+
+      let ownerRespondsOrProgresses = isOwner(resource.data.ownerId) &&
+        (
+          (prev == 'requested' && next in ['confirmed', 'declined']) ||
+          (prev == 'confirmed' && next == 'active') ||
+          (prev == 'active' && next == 'completed')
+        );
+
+      return onlyStatusAndUpdatedAtChanged &&
+        isRecentServerTimestamp('updatedAt') &&
+        (renterCancel || ownerRespondsOrProgresses || isAdmin());
+    }
+
+    // ===============================================================
+    // users
+    // ===============================================================
+
+    match /users/{userId} {
+      allow read: if isOwner(userId) || isAdmin();
+
+      allow create: if isOwner(userId) && isValidUser(request.resource.data) &&
+        isRecentServerTimestamp('createdAt') && isRecentServerTimestamp('updatedAt');
+
+      allow update: if (isOwner(userId) || isAdmin()) &&
+        isValidUser(request.resource.data) &&
+        areImmutableFieldsUnchanged(['uid', 'email', 'createdAt']) &&
+        isRecentServerTimestamp('updatedAt');
+
+      allow delete: if isAdmin();
+    }
+
+    // ===============================================================
+    // equipment
+    // ===============================================================
+
+    match /equipment/{equipmentId} {
+      allow read: if isAuthenticated();
+
+      allow create: if isAuthenticated() && isValidEquipment(request.resource.data) &&
+        isRecentServerTimestamp('createdAt') && isRecentServerTimestamp('updatedAt');
+
+      allow update: if (isOwner(resource.data.ownerId) || isAdmin()) &&
+        isValidEquipment(request.resource.data) &&
+        areImmutableFieldsUnchanged(['ownerId', 'createdAt']) &&
+        isRecentServerTimestamp('updatedAt');
+
+      allow delete: if isOwner(resource.data.ownerId) || isAdmin();
+    }
+
+    // ===============================================================
+    // bookings
+    // ===============================================================
+
+    match /bookings/{bookingId} {
+      allow read: if isAuthenticated() &&
+        (resource.data.renterId == request.auth.uid ||
+         resource.data.ownerId == request.auth.uid ||
+         isAdmin());
+
+      allow create: if isAuthenticated() && isValidBookingCreate(request.resource.data) &&
+        isRecentServerTimestamp('createdAt') && isRecentServerTimestamp('updatedAt');
+
+      allow update: if isAuthenticated() && isValidBookingStatusUpdate();
+
+      allow delete: if false;
+    }
+
+    // Deny everything else by default.
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}
