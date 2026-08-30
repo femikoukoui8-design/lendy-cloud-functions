@@ -7,20 +7,40 @@ service cloud.firestore {
     // ===============================================================
     //
     // Collection: users/{uid}
-    //   uid, email, displayName, photoURL?, phone?, createdAt, updatedAt
+    //   uid, email, displayName, photoURL?, phone?, city?, fcmTokens?,
+    //   identityVerificationStatus, stripeAccountId?, stripeOnboardingComplete,
+    //   ratingAverage, ratingCount, createdAt, updatedAt
     //   Contains PII (email, phone) -> owner-only read.
-    //   Admin privilege comes from a custom claim (auth.token.admin),
-    //   never from a field on this document.
+    //   identityVerificationStatus/stripeAccountId/stripeOnboardingComplete/
+    //   ratingAverage/ratingCount are server-only (Admin SDK) fields.
+    //   Admin privilege comes from a custom claim (auth.token.admin).
     //
     // Collection: equipment/{equipmentId}
     //   ownerId, ownerName, ownerPhotoURL?, title, description, category,
-    //   dailyRate, depositAmount, photos?, status, city?, createdAt, updatedAt
+    //   suggestedFor?, dailyRate, depositAmount, photos?, location, geohash?,
+    //   city?, status, createdAt, updatedAt
     //   No PII -> readable by any authenticated user.
+    //   status: pending_review -> available/rejected (admin only), then
+    //   owner may toggle available/unavailable/archived.
     //
     // Collection: bookings/{bookingId}
     //   equipmentId, ownerId, renterId, startDate, endDate, status,
-    //   totalPrice, depositAmount, createdAt, updatedAt
+    //   totalPrice, depositAmount, platformFeeAmount?, stripePaymentIntentId?,
+    //   paymentStatus?, depositStatus?, pickupPhotos?, pickupAt?,
+    //   returnPhotos?, returnAt?, createdAt, updatedAt
     //   Only the renter, the equipment owner, or an admin may read/write.
+    //   Payment fields are server-only (Cloud Function via Admin SDK).
+    //
+    // Collection: conversations/{conversationId}
+    //   participantIds (exactly 2), bookingId?, lastMessageText?,
+    //   lastMessageAt?, createdAt
+    //   Subcollection: conversations/{conversationId}/messages/{messageId}
+    //     senderId, text, sentAt, readBy?
+    //   Only the two participants may read/write.
+    //
+    // Collection: reviews/{reviewId}   (doc id == `${bookingId}_${authorId}`)
+    //   bookingId, authorId, targetId, rating, comment?, createdAt
+    //   Readable by any authenticated user; immutable once created.
     //
     // ===============================================================
 
@@ -75,6 +95,14 @@ service cloud.firestore {
          request.resource.data[field].size() <= maxLen);
     }
 
+    function isValidOptionalStringList(field, maxItems, maxItemLen) {
+      return !(field in request.resource.data) ||
+        (request.resource.data[field] is list &&
+         request.resource.data[field].size() <= maxItems);
+      // Note: per-element length/type validation is intentionally light —
+      // Firestore rules have no loops. Documented trade-off, see DATA_MODEL.md.
+    }
+
     function isPositiveNumber(field, maxValue) {
       return request.resource.data[field] is number &&
         request.resource.data[field] > 0 &&
@@ -94,43 +122,64 @@ service cloud.firestore {
     }
 
     // ===============================================================
-    // Domain validators
+    // Domain validators — users
     // ===============================================================
 
     function isValidUser(data) {
-      return hasOnlyAllowedFields(
-               ['uid', 'email', 'displayName', 'photoURL', 'phone', 'createdAt', 'updatedAt']
-             ) &&
-             hasRequiredFields(['uid', 'email', 'displayName', 'createdAt', 'updatedAt']) &&
+      return hasOnlyAllowedFields([
+               'uid', 'email', 'displayName', 'photoURL', 'phone', 'city',
+               'fcmTokens', 'identityVerificationStatus', 'stripeAccountId',
+               'stripeOnboardingComplete', 'ratingAverage', 'ratingCount',
+               'createdAt', 'updatedAt'
+             ]) &&
+             hasRequiredFields([
+               'uid', 'email', 'displayName', 'identityVerificationStatus',
+               'stripeOnboardingComplete', 'ratingAverage', 'ratingCount',
+               'createdAt', 'updatedAt'
+             ]) &&
              data.uid is string && data.uid == request.auth.uid &&
              isValidEmail(data.email) &&
              data.email == request.auth.token.email &&
              isValidStringLength('displayName', 1, 50) &&
              isValidOptionalStringLength('phone', 20) &&
+             isValidOptionalStringLength('city', 100) &&
+             isValidOptionalStringList('fcmTokens', 10, 200) &&
              (!('photoURL' in data) || isValidUrl(data.photoURL)) &&
+             data.identityVerificationStatus in ['unverified', 'pending', 'verified'] &&
+             data.stripeOnboardingComplete is bool &&
+             (!('stripeAccountId' in data) || (data.stripeAccountId is string && data.stripeAccountId.size() < 200)) &&
+             data.ratingAverage is number && data.ratingAverage >= 0 && data.ratingAverage <= 5 &&
+             data.ratingCount is number && data.ratingCount >= 0 &&
              data.createdAt is timestamp &&
              data.updatedAt is timestamp;
     }
 
-    function isValidEquipmentPhotos() {
-      return !('photos' in request.resource.data) ||
-        (request.resource.data.photos is list &&
-         request.resource.data.photos.size() <= 10);
-      // Note: per-URL validation of list contents is intentionally light here;
-      // harden with an allOf/exists-based check if photos become user-critical.
+    // Fields only a Cloud Function (Admin SDK, bypasses rules) may change.
+    function userServerFieldsUnchanged() {
+      return areImmutableFieldsUnchanged([
+        'identityVerificationStatus', 'stripeAccountId',
+        'stripeOnboardingComplete', 'ratingAverage', 'ratingCount'
+      ]);
     }
 
+    // ===============================================================
+    // Domain validators — equipment
+    // ===============================================================
+
     function isValidEquipment(data) {
-      let allowedCategories = ['camera', 'lens', 'drone', 'audio', 'lighting', 'accessory', 'other'];
-      let allowedStatuses = ['available', 'unavailable', 'archived'];
+      let allowedCategories = ['hybride_compact', 'action_cam', 'drone', 'accessoire'];
+      let allowedStatuses = ['pending_review', 'available', 'unavailable', 'rejected', 'archived'];
+      let allowedIntents = ['voyage', 'se_lancer', 'projet_ponctuel'];
       return hasOnlyAllowedFields([
                'ownerId', 'ownerName', 'ownerPhotoURL', 'title', 'description',
-               'category', 'dailyRate', 'depositAmount', 'photos', 'status',
-               'city', 'createdAt', 'updatedAt'
+               'category', 'suggestedFor', 'dailyRate', 'depositAmount',
+               'photos', 'location', 'geohash', 'city', 'status',
+               'createdAt', 'updatedAt'
              ]) &&
              hasRequiredFields([
                'ownerId', 'ownerName', 'title', 'description', 'category',
-               'dailyRate', 'depositAmount', 'status', 'createdAt', 'updatedAt'
+               'dailyRate', 'depositAmount', 'location', 'status',
+               'createdAt', 'updatedAt'
              ]) &&
              data.ownerId is string && data.ownerId == request.auth.uid &&
              isValidStringLength('ownerName', 1, 50) &&
@@ -138,13 +187,36 @@ service cloud.firestore {
              isValidStringLength('title', 1, 100) &&
              isValidStringLength('description', 1, 2000) &&
              data.category in allowedCategories &&
+             (!('suggestedFor' in data) ||
+              (data.suggestedFor is list && data.suggestedFor.size() <= 3 &&
+               data.suggestedFor.hasOnly(allowedIntents))) &&
              isPositiveNumber('dailyRate', 100000) &&
              isNonNegativeNumber('depositAmount', 1000000) &&
-             isValidEquipmentPhotos() &&
-             data.status in allowedStatuses &&
+             isValidOptionalStringList('photos', 10, 500) &&
+             data.location is latlng &&
+             isValidOptionalStringLength('geohash', 20) &&
              isValidOptionalStringLength('city', 100) &&
+             data.status in allowedStatuses &&
              data.createdAt is timestamp &&
              data.updatedAt is timestamp;
+    }
+
+    function isValidEquipmentStatusTransition() {
+      let prev = resource.data.status;
+      let next = request.resource.data.status;
+      let ownerStates = ['available', 'unavailable', 'archived'];
+      let statusUnchanged = prev == next;
+      let ownerToggle = isOwner(resource.data.ownerId) && prev in ownerStates && next in ownerStates;
+      let ownerResubmit = isOwner(resource.data.ownerId) && prev == 'rejected' && next == 'pending_review';
+      return statusUnchanged || ownerToggle || ownerResubmit || isAdmin();
+    }
+
+    // ===============================================================
+    // Domain validators — bookings
+    // ===============================================================
+
+    function bookingServerFields() {
+      return ['platformFeeAmount', 'stripePaymentIntentId', 'paymentStatus', 'depositStatus'];
     }
 
     function isValidBookingCreate(data) {
@@ -171,27 +243,93 @@ service cloud.firestore {
              data.updatedAt is timestamp;
     }
 
-    // Only the status (and updatedAt) may change after creation, and only
-    // along an allowed transition performed by the correct party.
+    // Only the status (+updatedAt, and the pickup/return fields on the
+    // matching transition) may change after creation, along an allowed
+    // transition performed by the correct party. Payment fields set by a
+    // Cloud Function via the Admin SDK never pass through this — client
+    // writes to them are rejected by the `hasOnly` checks below.
     function isValidBookingStatusUpdate() {
       let prev = resource.data.status;
       let next = request.resource.data.status;
-      let onlyStatusAndUpdatedAtChanged =
-        request.resource.data.diff(resource.data).affectedKeys().hasOnly(['status', 'updatedAt']);
+      let changedKeys = request.resource.data.diff(resource.data).affectedKeys();
 
       let renterCancel = isOwner(resource.data.renterId) &&
-        prev in ['requested', 'confirmed'] && next == 'cancelled';
+        prev in ['requested', 'confirmed'] && next == 'cancelled' &&
+        changedKeys.hasOnly(['status', 'updatedAt']);
 
-      let ownerRespondsOrProgresses = isOwner(resource.data.ownerId) &&
-        (
-          (prev == 'requested' && next in ['confirmed', 'declined']) ||
-          (prev == 'confirmed' && next == 'active') ||
-          (prev == 'active' && next == 'completed')
-        );
+      let ownerRespond = isOwner(resource.data.ownerId) &&
+        prev == 'requested' && next in ['confirmed', 'declined'] &&
+        changedKeys.hasOnly(['status', 'updatedAt']);
 
-      return onlyStatusAndUpdatedAtChanged &&
-        isRecentServerTimestamp('updatedAt') &&
-        (renterCancel || ownerRespondsOrProgresses || isAdmin());
+      let ownerStartRental = isOwner(resource.data.ownerId) &&
+        prev == 'confirmed' && next == 'active' &&
+        changedKeys.hasOnly(['status', 'updatedAt', 'pickupPhotos', 'pickupAt']) &&
+        request.resource.data.pickupPhotos is list &&
+        request.resource.data.pickupPhotos.size() >= 1 &&
+        request.resource.data.pickupPhotos.size() <= 10 &&
+        isRecentServerTimestamp('pickupAt');
+
+      let ownerCompleteRental = isOwner(resource.data.ownerId) &&
+        prev == 'active' && next == 'completed' &&
+        changedKeys.hasOnly(['status', 'updatedAt', 'returnPhotos', 'returnAt']) &&
+        request.resource.data.returnPhotos is list &&
+        request.resource.data.returnPhotos.size() >= 1 &&
+        request.resource.data.returnPhotos.size() <= 10 &&
+        isRecentServerTimestamp('returnAt');
+
+      return isRecentServerTimestamp('updatedAt') &&
+        (renterCancel || ownerRespond || ownerStartRental || ownerCompleteRental || isAdmin());
+    }
+
+    // ===============================================================
+    // Domain validators — conversations & messages
+    // ===============================================================
+
+    function isValidConversationCreate(data) {
+      return hasOnlyAllowedFields(['participantIds', 'bookingId', 'lastMessageText', 'lastMessageAt', 'createdAt']) &&
+        hasRequiredFields(['participantIds', 'createdAt']) &&
+        data.participantIds is list &&
+        data.participantIds.size() == 2 &&
+        data.participantIds[0] != data.participantIds[1] &&
+        data.participantIds.hasAny([request.auth.uid]) &&
+        (!('bookingId' in data) || (data.bookingId is string)) &&
+        (!('lastMessageText' in data) || isValidOptionalStringLength('lastMessageText', 300)) &&
+        data.createdAt is timestamp;
+    }
+
+    function isParticipant(conversationId) {
+      let conversation = get(/databases/$(database)/documents/conversations/$(conversationId));
+      return conversation.data.participantIds.hasAny([request.auth.uid]);
+    }
+
+    function isValidMessageCreate(conversationId, data) {
+      return hasOnlyAllowedFields(['senderId', 'text', 'sentAt', 'readBy']) &&
+        hasRequiredFields(['senderId', 'text', 'sentAt']) &&
+        data.senderId == request.auth.uid &&
+        isParticipant(conversationId) &&
+        isValidStringLength('text', 1, 2000) &&
+        isRecentServerTimestamp('sentAt');
+    }
+
+    // ===============================================================
+    // Domain validators — reviews
+    // ===============================================================
+
+    function isValidReviewCreate(reviewId, data) {
+      let bookingDoc = get(/databases/$(database)/documents/bookings/$(data.bookingId));
+      let isRenter = bookingDoc.data.renterId == request.auth.uid;
+      let isBookingOwner = bookingDoc.data.ownerId == request.auth.uid;
+      let expectedTarget = isRenter ? bookingDoc.data.ownerId : bookingDoc.data.renterId;
+      return hasOnlyAllowedFields(['bookingId', 'authorId', 'targetId', 'rating', 'comment', 'createdAt']) &&
+        hasRequiredFields(['bookingId', 'authorId', 'targetId', 'rating', 'createdAt']) &&
+        reviewId == (data.bookingId + '_' + data.authorId) &&
+        data.authorId == request.auth.uid &&
+        (isRenter || isBookingOwner) &&
+        bookingDoc.data.status == 'completed' &&
+        data.targetId == expectedTarget &&
+        data.rating is int && data.rating >= 1 && data.rating <= 5 &&
+        isValidOptionalStringLength('comment', 1000) &&
+        isRecentServerTimestamp('createdAt');
     }
 
     // ===============================================================
@@ -207,6 +345,7 @@ service cloud.firestore {
       allow update: if (isOwner(userId) || isAdmin()) &&
         isValidUser(request.resource.data) &&
         areImmutableFieldsUnchanged(['uid', 'email', 'createdAt']) &&
+        (isAdmin() || userServerFieldsUnchanged()) &&
         isRecentServerTimestamp('updatedAt');
 
       allow delete: if isAdmin();
@@ -220,11 +359,13 @@ service cloud.firestore {
       allow read: if isAuthenticated();
 
       allow create: if isAuthenticated() && isValidEquipment(request.resource.data) &&
+        (request.resource.data.status == 'pending_review' || isAdmin()) &&
         isRecentServerTimestamp('createdAt') && isRecentServerTimestamp('updatedAt');
 
       allow update: if (isOwner(resource.data.ownerId) || isAdmin()) &&
         isValidEquipment(request.resource.data) &&
         areImmutableFieldsUnchanged(['ownerId', 'createdAt']) &&
+        isValidEquipmentStatusTransition() &&
         isRecentServerTimestamp('updatedAt');
 
       allow delete: if isOwner(resource.data.ownerId) || isAdmin();
@@ -245,6 +386,49 @@ service cloud.firestore {
 
       allow update: if isAuthenticated() && isValidBookingStatusUpdate();
 
+      allow delete: if false;
+    }
+
+    // ===============================================================
+    // conversations & messages
+    // ===============================================================
+
+    match /conversations/{conversationId} {
+      allow read: if isAuthenticated() && resource.data.participantIds.hasAny([request.auth.uid]);
+
+      allow create: if isAuthenticated() && isValidConversationCreate(request.resource.data);
+
+      // Only the denormalized "last message" preview may change.
+      allow update: if isAuthenticated() &&
+        resource.data.participantIds.hasAny([request.auth.uid]) &&
+        areImmutableFieldsUnchanged(['participantIds', 'bookingId', 'createdAt']) &&
+        request.resource.data.diff(resource.data).affectedKeys().hasOnly(['lastMessageText', 'lastMessageAt']);
+
+      allow delete: if false;
+
+      match /messages/{messageId} {
+        allow read: if isAuthenticated() && isParticipant(conversationId);
+
+        allow create: if isAuthenticated() && isValidMessageCreate(conversationId, request.resource.data);
+
+        // Marking a message as read: only `readBy` may change.
+        allow update: if isAuthenticated() && isParticipant(conversationId) &&
+          request.resource.data.diff(resource.data).affectedKeys().hasOnly(['readBy']);
+
+        allow delete: if false;
+      }
+    }
+
+    // ===============================================================
+    // reviews
+    // ===============================================================
+
+    match /reviews/{reviewId} {
+      allow read: if isAuthenticated();
+
+      allow create: if isAuthenticated() && isValidReviewCreate(reviewId, request.resource.data);
+
+      allow update: if false;
       allow delete: if false;
     }
 
