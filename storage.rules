@@ -1,0 +1,66 @@
+rules_version = '2';
+service firebase.storage {
+  match /b/{bucket}/o {
+
+    // ===============================================================
+    // Assumed layout — see DATA_MODEL.md "Cloud Storage layout"
+    //
+    //   /users/{uid}/profile/{fileName}              — profile photo
+    //   /equipment/{equipmentId}/{fileName}           — listing photos
+    //   /bookings/{bookingId}/pickup/{fileName}        — état des lieux avant
+    //   /bookings/{bookingId}/return/{fileName}         — état des lieux après
+    //
+    // This is a reviewed prototype, not a security guarantee — see
+    // DATA_MODEL.md / README before shipping to real users.
+    // ===============================================================
+
+    function isAuthenticated() {
+      return request.auth != null;
+    }
+
+    function isAdmin() {
+      return isAuthenticated() && request.auth.token.admin == true;
+    }
+
+    function isImageUnder10MB() {
+      return request.resource.size < 10 * 1024 * 1024 &&
+        request.resource.contentType.matches('image/.*');
+    }
+
+    function equipmentOwnerId(equipmentId) {
+      return firestore.get(/databases/(default)/documents/equipment/$(equipmentId)).data.ownerId;
+    }
+
+    function bookingParty(bookingId) {
+      let booking = firestore.get(/databases/(default)/documents/bookings/$(bookingId)).data;
+      return isAuthenticated() &&
+        (request.auth.uid == booking.renterId || request.auth.uid == booking.ownerId);
+    }
+
+    match /users/{uid}/profile/{fileName} {
+      allow read: if isAuthenticated();
+      allow write: if isAuthenticated() && request.auth.uid == uid && isImageUnder10MB();
+    }
+
+    match /equipment/{equipmentId}/{fileName} {
+      allow read: if isAuthenticated();
+      allow write: if isAuthenticated() &&
+        (request.auth.uid == equipmentOwnerId(equipmentId) || isAdmin()) &&
+        isImageUnder10MB();
+    }
+
+    match /bookings/{bookingId}/pickup/{fileName} {
+      allow read: if bookingParty(bookingId) || isAdmin();
+      allow write: if (bookingParty(bookingId) || isAdmin()) && isImageUnder10MB();
+    }
+
+    match /bookings/{bookingId}/return/{fileName} {
+      allow read: if bookingParty(bookingId) || isAdmin();
+      allow write: if (bookingParty(bookingId) || isAdmin()) && isImageUnder10MB();
+    }
+
+    match /{allPaths=**} {
+      allow read, write: if false;
+    }
+  }
+}
