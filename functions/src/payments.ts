@@ -6,14 +6,25 @@ import Stripe from "stripe";
 const stripeSecretKey = defineSecret("STRIPE_SECRET_KEY");
 
 /**
- * Take rate applied to the renter's rent payment via application_fee_amount
- * (owner receives price_total minus this fee through transfer_data). Per
- * Master Spec §22 ("Décisions prises", 14 août 2026 update): "Taux de
- * commission : 5% côté locataire (...), 15% retenus côté loueur au
- * versement". Only the 5% is implemented here; the additional 15%
- * owner-side commission is not yet wired up.
+ * Two-sided commission per Master Spec §22 ("Décisions prises", 14 août
+ * 2026 update): "Taux de commission : 5% côté locataire (frais de service
+ * affichés au paiement), 15% retenus côté loueur au versement" — 20%
+ * cumulative take rate, matching the Lightyshare benchmark cited in §7.
+ *
+ * - RENTER_FEE_RATE: service fee added on top of price_total — this is
+ *   what the renter actually pays alongside the rental price.
+ * - OWNER_COMMISSION_RATE: cut withheld from price_total before the owner
+ *   is paid out.
+ *
+ * Both are collected in a single application_fee_amount on the rent
+ * PaymentIntent (Stripe destination charge): the renter is charged
+ * price_total * (1 + RENTER_FEE_RATE), the platform keeps
+ * price_total * (RENTER_FEE_RATE + OWNER_COMMISSION_RATE) as its fee, and
+ * transfer_data sends the remainder — price_total * (1 - OWNER_COMMISSION_RATE),
+ * i.e. 85% of price_total — to the owner's connected account.
  */
-const RENTER_COMMISSION_RATE = 0.05;
+const RENTER_FEE_RATE = 0.05;
+const OWNER_COMMISSION_RATE = 0.15;
 
 let stripeClient: Stripe | undefined;
 function getStripe(): Stripe {
@@ -121,11 +132,20 @@ export const createBookingPaymentIntent = onCall<CreateBookingPaymentIntentReque
     // it's stored uppercase (e.g. "EUR") in items.currency.
     const currency = String(item.currency).toLowerCase();
 
-    const rentAmount = Math.round(booking.price_total);
-    const applicationFeeAmount = Math.round(rentAmount * RENTER_COMMISSION_RATE);
+    const priceTotal = booking.price_total;
+    // What the renter is actually charged: rental price + renter-side service fee.
+    const chargedAmount = Math.round(priceTotal * (1 + RENTER_FEE_RATE));
+    // Platform's total cut: the renter fee (never reaches the owner) plus the
+    // owner-side commission withheld before payout.
+    const applicationFeeAmount = Math.round(
+      priceTotal * (RENTER_FEE_RATE + OWNER_COMMISSION_RATE)
+    );
+    // What transfer_data actually sends to the owner: chargedAmount minus
+    // applicationFeeAmount, i.e. price_total * (1 - OWNER_COMMISSION_RATE) —
+    // 85% of the rental price, modulo independent rounding of the two amounts above.
 
     const rentIntent = await stripe.paymentIntents.create({
-      amount: rentAmount,
+      amount: chargedAmount,
       currency,
       transfer_data: { destination: owner.stripe_account_id },
       application_fee_amount: applicationFeeAmount,
