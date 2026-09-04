@@ -151,6 +151,7 @@ Choix d'intention (voyage / se lancer / projet ponctuel) → recommandations ada
 
 - **V1** : location uniquement, remise en main propre, Paris, catalogue grand public photo/vidéo/drone.
 - **V2** (non détaillée) : vente, livraison, expansion géographique, assurance intégrée, vérification d'identité renforcée.
+- **Idée V2 — Assistant IA de recommandation** : l'utilisateur décrit son projet/besoin en texte libre (ou répond à quelques questions guidées), et une IA (API Claude, modèle léger type Haiku) analyse le besoin et propose 2-3 annonces adaptées du catalogue avec une explication courte. Extension naturelle du différenciateur "parcours guidé par intention" déjà présent dans le MVP. Architecture envisagée : Cloud Function dédiée dans `lendy-cloud-functions`, appelant l'API Claude avec le texte utilisateur + le catalogue Firestore disponible. Point de vigilance : coût à l'usage de l'API Claude, séparé de l'abonnement Claude Pro — modeste au démarrage mais croît avec le volume. Décision : reporté après un MVP fonctionnel de bout en bout (recherche → réservation → paiement), pour ne pas disperser l'énergie de développement avant que le parcours principal ne fonctionne.
 
 ---
 
@@ -182,18 +183,20 @@ Choix d'intention (voyage / se lancer / projet ponctuel) → recommandations ada
 - Marché de lancement : Paris.
 - Paiement/caution : Stripe Connect avec pré-autorisation.
 - Stack technique de départ : FlutterFlow + Firebase (backend à reconfirmer).
+- Taux de commission : 5% côté locataire (frais de service affichés au paiement), 15% retenus côté loueur au versement — benchmark Lightyshare repris tel quel.
 
 ---
 
 ## 23. Questions ouvertes
 
-- Taux de commission définitif (locataire / loueur).
 - Montant de caution par catégorie de matériel.
 - Firebase vs Supabase — choix définitif du backend.
 - Niveau de vérification d'identité à l'inscription.
 - Stratégie marketing et calendrier d'acquisition détaillés pour ce persona.
 - Palette et identité visuelle à revalider pour le nouveau positionnement.
 - Budget et temps disponibles pour le lancement (non communiqués à ce stade).
+- Flux d'inscription Stripe Connect pour les loueurs (recevoir des paiements) — pas encore construit, à rattacher à la section "Mes annonces" du profil.
+- Gestion des réservations faites plus de 7 jours à l'avance (la pré-autorisation de caution expire avant la remise du matériel) — edge case ignoré volontairement pour le MVP, à traiter plus tard.
 
 ---
 
