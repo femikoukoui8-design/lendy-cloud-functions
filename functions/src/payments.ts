@@ -6,10 +6,14 @@ import Stripe from "stripe";
 const stripeSecretKey = defineSecret("STRIPE_SECRET_KEY");
 
 /**
- * Two-sided commission per Master Spec §22 ("Décisions prises", 14 août
- * 2026 update): "Taux de commission : 5% côté locataire (frais de service
- * affichés au paiement), 15% retenus côté loueur au versement" — 20%
- * cumulative take rate, matching the Lightyshare benchmark cited in §7.
+ * Décision de commission confirmée en conversation avec le fondateur, à
+ * formaliser dans la Master Spec (correction en cours) : 5% côté locataire
+ * (frais de service affichés au paiement), 15% retenus côté loueur au
+ * versement — 20% cumulé, du même ordre que le benchmark Lightyshare cité
+ * en §7. Au moment d'écrire ceci, la Master Spec §22/§23 ne documente pas
+ * encore ce taux (§23 le liste toujours comme question ouverte) — ne pas
+ * réintroduire de fausse citation "§22" tant que la spec n'a pas été mise
+ * à jour en conséquence.
  *
  * - RENTER_FEE_RATE: service fee added on top of price_total — this is
  *   what the renter actually pays alongside the rental price.
