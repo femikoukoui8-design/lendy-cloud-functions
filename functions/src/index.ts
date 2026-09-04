@@ -7,6 +7,8 @@ import { getFirestore, FieldValue } from "firebase-admin/firestore";
 
 initializeApp();
 
+export { createBookingPaymentIntent } from "./payments";
+
 /**
  * Auth lifecycle trigger — Firebase user lifecycle events (onCreate/onDelete)
  * are still 1st-gen only, hence the v1 import. Seeds the users/{uid} Firestore
